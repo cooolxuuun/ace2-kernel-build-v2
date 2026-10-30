@@ -351,6 +351,12 @@
 # carry the same KMI part in Collect; (c) the Package step refuses to
 # build a zip AK3 would abort on, and puts the real version on AK3's
 # flash screen.
+# Gotcha found by run #1 (2026-10-30, first run of this version): the
+# Image also contains the printk format string "Linux version %s (%s)",
+# and `strings` reports it before the real banner -- the package
+# pre-flight read "%s" and refused to package. Every extraction below
+# therefore filters on a digit after "Linux version", never on the bare
+# prefix.
 # The trailing -g<hash> deliberately stays the real local commit. AK3
 # never compares it (its regex truncates at -androidNN), and printing the
 # stock hash on a patched kernel would only hide which build is running.
@@ -856,7 +862,9 @@ jobs:
           # v19: show the version string actually baked into the Image
           # (linux_banner). It must carry -android12-9-o-, otherwise
           # AnyKernel3 refuses to flash it; the hard gate is in Collect.
-          strings "$OUT/arch/arm64/boot/Image" | grep -E '^Linux version ' | head -n 1 || true
+          # Filter on a digit after "Linux version": the binary also holds
+          # the format string "Linux version %s (%s)".
+          strings "$OUT/arch/arm64/boot/Image" | grep -oE 'Linux version [0-9]+\.[0-9]+\.[0-9]+-[^ ]*' | head -n 1 || true
           if grep -q 'modpost: .* undefined!' "$GITHUB_WORKSPACE/build.log"; then
             echo "ERROR: modpost reported undefined symbols:"
             grep 'modpost: .* undefined!' "$GITHUB_WORKSPACE/build.log" | sort -u | head -n 20
@@ -1040,7 +1048,11 @@ jobs:
           # compares the 2nd dash-field of Image vs the phone's boot.img.
           # An Image reading "5.10.236-o-g..." matches nothing -> AK3
           # aborts on the device. Never package such an Image.
-          IMG_VER="$(strings artifacts/Image | grep -E '^Linux version ' | head -n 1 | awk '{print $3}' || true)"
+          # Pick the version with a digit-based pattern, not just the
+          # "^Linux version " prefix: the Image also contains the printk
+          # format string "Linux version %s (%s)", which `strings` reports
+          # first (run #1 died on exactly that, reading "%s" as version).
+          IMG_VER="$(strings artifacts/Image | grep -oE 'Linux version [0-9]+\.[0-9]+\.[0-9]+-[^ ]*' | head -n 1 | cut -d' ' -f3 || true)"
           IMG_AK3="$(printf '%s' "$IMG_VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+-android[0-9]+' || true)"
           A_REL="$(printf '%s' "$BRANCH" | sed -n 's/^\(android[0-9]\{2,\}\)-.*/\1/p')"
           if [ -z "$IMG_AK3" ]; then
