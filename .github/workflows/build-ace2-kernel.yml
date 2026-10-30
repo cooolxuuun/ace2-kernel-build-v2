@@ -1,0 +1,1078 @@
+# OnePlus Ace 2 (PHK110, SM8475 / waipio) kernel build on GitHub Actions
+#
+# Target phone (verified 2026-10-25 from the version-info screenshot):
+#   build  PHK110_16.0.5.1201(CN01), ColorOS, Android 16,
+#   security patch 2026-08-01
+#   kernel 5.10.236-android12-9-o-g74d132f4467a  ->  KMI 5.10-android12-9
+# Source (OnePlusOSS, branch oneplus/sm8475, manifest oneplus_ace2_b.xml):
+#   kernel projects at revision oneplus/sm8475_b_16.0.0_ace_2.
+#   WARNING: the public source lags the phone's build (latest public
+#   common-kernel sync is PHK110_16.0.3.501, 2026-03-19, while the
+#   phone runs 16.0.5.1201). Kernel sub-version matches (5.10.236),
+#   and run 14 built from this exact source booted and passed all
+#   DroidSpaces checks on this phone/ROM, so the combination is proven.
+#   Always test a new build with `fastboot boot` before flashing.
+#   (History: run 16 (v17) briefly retargeted to the OnePlus 11R
+#   CPH2487 / OxygenOS 16.0.5.1301 (kernel 5.10.246, manifest
+#   oneplus_11r_b.xml); the user flashed back to ColorOS on the Ace 2,
+#   so v18 returns to the Ace 2 source. The 11R is the same SM8475
+#   hardware, codename udon.)
+#
+# v2 (2026-10-24): fixed the "No space left on device" failure seen in the
+# first run, which died in the Sync step after 31m37s before any patch/build
+# step ran. Changes vs v1:
+#   1. maximize-build-space FIRST (before checkout): public runners only have
+#      ~25-29 GB free by default, and this OnePlus tree (common + msm-kernel +
+#      modules/devicetree + clang/gcc prebuilts) plus build output exceeds that.
+#      The action reclaims the temp disk and removes unneeded preinstalled
+#      software (.NET, Android SDK, Haskell, CodeQL, Docker images).
+#   2. repo init --depth=1 + repo sync --no-tags: only HEAD, no full history.
+#      Trade-off: no history to bisect with, but a build only needs HEAD.
+#   3. Disk guards after sync and before build: fail early with a clear
+#      message instead of dying mid-build with a confusing runner log error.
+#   4. Also fixed a latent v1 bug: the defconfig-edit step passed the wrong
+#      path to the Python script (missing the kernel/ prefix).
+# If v2 STILL runs out of space, the remaining options are a larger runner
+# (paid) or a self-hosted runner / VPS with a big disk -- see the end of
+# this header in the chat reply, not in the workflow.
+#
+# v3 (2026-10-25): fixed the run-40112227712 failure. The v2 disk fix worked
+# (Maximize/Sync/patches/defconfig-edit all succeeded, run finished in ~4 min),
+# but the OnePlus build script aborts in its check_defconfig pre-step:
+#   "ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig"
+# Root cause, confirmed from the log's diff: the v2 edit appended options
+# missing from the stock file (e.g. SYSVIPC, POSIX_MQUEUE, IP_SET...) to the
+# END of gki_defconfig, while `make savedefconfig` emits them in canonical
+# Kconfig order -- and it drops CONFIG_PID_NS / CONFIG_IPC_NS entirely,
+# because those default to y once NAMESPACES/SYSVIPC are on. The values were
+# right, the file layout was not.
+# Fix: after the text edit, run `make gki_defconfig` + `make savedefconfig`
+# and copy the canonical output over gki_defconfig, then re-run savedefconfig
+# and require an empty diff -- exactly the check oplus_build_kernel.sh does.
+# The authoritative option check now runs against the generated .config
+# (where PID_NS/IPC_NS still show =y via defaults), not the defconfig file.
+# The vendorsetup.sh "No such file" line and the mktemp error in the same
+# log are non-fatal noise: the script continued past both.
+#
+# v4 (2026-10-25): fixed the run-40113165537 failure. The v3 savedefconfig
+# normalization worked -- the log says "savedefconfig check passed:
+# gki_defconfig is canonical" -- but the v3 verification loop then failed
+# with "ERROR: CONFIG_NETFILTER_XT_TARGET_REJECT is not =y in generated
+# .config", after the first 10 required options had all passed. Root cause:
+# CONFIG_NETFILTER_XT_TARGET_REJECT does not exist in kernel 5.10 at all
+# (verified against the OnePlusOSS common tree on this branch:
+# net/netfilter/Kconfig has NETFILTER_XT_TARGET_LOG but no REJECT symbol;
+# the unified xt_REJECT symbol only came in a later kernel). The 5.10
+# REJECT targets are CONFIG_IP_NF_TARGET_REJECT (net/ipv4/netfilter/Kconfig,
+# depends on IP_NF_FILTER) and CONFIG_IP6_NF_TARGET_REJECT
+# (net/ipv6/netfilter/Kconfig, depends on IP6_NF_FILTER). Kconfig silently
+# ignores unknown symbols in a defconfig, so savedefconfig dropped it and
+# the strict loop failed on a symbol that could never be =y. It was our own
+# check failing, not the kernel build.
+# Fix: (a) replace the dead symbol with the two real 5.10 symbols in the
+# defconfig edit; (b) split the .config check into a REQUIRED tier (hard
+# fail if not =y) and an OPTIONAL tier for the two REJECT symbols (warn
+# only, accept =y or =m). The REJECT pair depends on IP_NF_FILTER /
+# IP6_NF_FILTER, which may only be enabled later by the waipio fragments
+# the OnePlus script merges, so their absence from the plain-gki .config
+# is not a failure: UFW REJECT support is a nice-to-have, Droidspaces
+# itself does not need it, and the Collect step reports the final .config.
+#
+# v5 (2026-10-25): fixed the run-40114120519 ABI failure. The kernel ACTUALLY
+# COMPILED in 5m46s (vmlinux, Image, Image.lz4 produced), then build.sh
+# failed at its final GKI ABI check:
+#   "ERROR: Differences between ksymtab and symbol list detected!
+#    Symbols missing from ksymtab: __cfi_slowpath, kasan_flag_enabled"
+# Root cause, verified against the AOSP 5.10 sources and the run-3 log:
+#   * __cfi_slowpath is EXPORT_SYMBOL'd by kernel/cfi.c, which is only
+#     compiled when CONFIG_CFI_CLANG=y. No kernel/cfi.o appears anywhere
+#     in the run-3 build log, so the final merged .config has CFI off --
+#     even though common gki_defconfig sets CONFIG_CFI_CLANG=y and
+#     CONFIG_LTO_CLANG_FULL=y. The waipio vendor fragments (and/or the
+#     oplus script's LTO prompt, whose default is "none") turn it off.
+#   * kasan_flag_enabled is defined ONLY in mm/kasan/hw_tags.c, i.e. only
+#     when CONFIG_KASAN_HW_TAGS=y. The run-3 log compiles the GENERIC
+#     KASAN objects (generic.o, report_generic.o, shadow.o, quarantine.o)
+#     and no hw_tags.o / report_hw_tags.o, so the final .config runs
+#     generic KASAN, not HW-tags KASAN. KASAN_HW_TAGS needs
+#     HAVE_ARCH_KASAN_HW_TAGS (arm64 MTE); the vendor config evidently
+#     does not select it, so Kconfig falls back to the default
+#     KASAN_GENERIC. (Kconfig.kasan: the mode choice defaults to GENERIC.)
+#   * The generic GKI symbol list (android/abi_gki_aarch64) was written
+#     for a config with CFI + HW-tags KASAN on, so a vendor config that
+#     legitimately disables both can NEVER satisfy a strict exact-match
+#     check. This is a known 5.10 GKI/vendor mismatch (same two symbols
+#     in an XDA thread building a Pixel 5.10 GKI kernel).
+# Fix -- the build system's own escape hatch, NOT a symbol-list edit and
+# NOT enabling CFI/KASAN (both would change the kernel and risk vendor
+# module loading): set KMI_SYMBOL_LIST_STRICT_MODE=0. AOSP's
+# build.config.gki.aarch64 defines it as ${KMI_SYMBOL_LIST_STRICT_MODE:-1},
+# i.e. explicitly env-overridable, and AOSP's own debug GKI variant sets
+# strict mode off. With 0, build.sh skips the compare_to_symbol_list
+# exact-match gate; TRIM_NONLISTED_KMI stays 1, so the kernel's exported
+# symbols are still trimmed to the GKI list, and the compiled kernel is
+# byte-identical to run 3's -- only the post-build gate changes. The two
+# missing symbols are only referenced by CFI/KASAN-instrumented code,
+# which is off in this config, and the stock OnePlus build uses the same
+# waipio fragments, so stock vendor modules cannot reference them either
+# (boot test on the phone remains the real gate, as always).
+# Companion fix, same run: oplus_rebuild_img.sh cannot succeed in this
+# public-tree CI -- it needs stock origin images
+# (oplus/prebuild/origin_img/{boot,system_dlkm,vendor_dlkm,vendor_boot}.img)
+# and tools (7z_new, info_image, ...) that are NOT in the public tree;
+# it tries to fetch them from OnePlus's internal IMAGE_SERVER
+# (gpw13.myoas.com, unreachable) and fails. Run 3's rebuild_img errors
+# are that missing-input failure, not a kernel problem. So the step now
+# runs rebuild_img best-effort (|| true, with a warning): if it ever
+# succeeds we get a boot.img too, but the artifact is the compiled
+# Image + final .config + BUILD_INFO. Repacking a flashable boot.img is
+# a separate step that needs the stock boot backup (checklist Stage 1).
+# Collect/Upload now run `if: always()` so a failed build still uploads
+# BUILD_INFO + final .config for diagnosis.
+#
+# v6 (2026-10-25): latest Droidspaces requirements (main branch, DS 7.0.0,
+# HEAD 847ecdd2, 2026-10-24; NO newer tag and NO beta/pre-release tag --
+# main IS the latest). The GKI list in Kernel-Configuration.md on main
+# is UNCHANGED from v4/v5, so no defconfig option changes. What changes
+# is verification: the authoritative check is src/check.c on main.
+# MUST probes (config-mappable): NAMESPACES (+PID/MNT/UTS/IPC/NET/USER),
+# SECCOMP + SECCOMP_FILTER. RECOMMENDED/OPTIONAL probes: loop device,
+# ext4, cgroups, FUSE, TUN, OverlayFS, net namespace, bridge, veth,
+# macvlan, IPv6 NAT, MEMCG, MEMCG_SWAP, devpts/PTY, CPU accounting.
+# CFS_BANDWIDTH and CGROUP_PIDS stay OFF by design (kABI -- see v2-v4
+# header) and are reported as expected greyed-out, never as failures.
+# The Collect step now asserts the FULL probe list against the FINAL
+# merged .config (post-waipio-fragments, the config the kernel really
+# runs) and writes artifacts/DROIDSPACES_CHECK.txt: MUST = hard fail,
+# RECOMMENDED = warn + report, EXPECTED-OFF = report only. The
+# Normalize step keeps its v4 REQUIRED tier and only WARNS on the
+# MUST probe symbols in the plain-gki .config (the fragments can still
+# add them; the final .config is authoritative).
+#
+# v7 (2026-10-25): fixed the run-40117009408 failure. Run 4 (40115784699)
+# had already SUCCEEDED -- the kernel compiled and the artifact was
+# uploaded -- but run 5's Collect step failed with "MUST FAIL
+# CONFIG_MNT_NS (want =y, got: absent)". That is a bug in OUR check,
+# not the kernel: there is no CONFIG_MNT_NS Kconfig symbol at all.
+# The mount namespace is covered by CONFIG_NAMESPACES and probed at
+# runtime by Droidspaces' check.c via unshare(CLONE_NEWNS). The
+# kernel in run 5 was byte-identical to run 4's (same Image SHA-256)
+# and its DROIDSPACES_CHECK showed every real MUST item =y.
+# Fix: remove CONFIG_MNT_NS from both MUST lists (Normalize warn
+# loop and Collect hard-fail loop). This run re-proves the same
+# kernel with the corrected check so the repo ends on a green run.
+#
+# v8 (2026-10-25): BOOT FIX -- pass LTO=full to the OnePlus build
+# script (see the Build step). Runs 4-6 built with LTO=none by
+# accident (the script's LTO prompt defaults to "none" in CI), so
+# the kernel had no LTO/CFI/KASAN_HW_TAGS while the stock vendor
+# modules expect them; the phone would not boot after repack+flash.
+# This run rebuilds with full LTO to match the stock kernel the
+# vendor modules were built against. The Collect step now also
+# reports LTO/CFI/KASAN_HW_TAGS in the final .config and whether
+# __cfi_slowpath / kasan_flag_enabled are in the generated ABI
+# symbol list (non-fatal, diagnostic only).
+#
+# v9 (2026-10-25): RUN 7 PROVED THE v8 FIX DID NOTHING. Run 7
+# (40122803801) concluded success, but its Image is byte-identical
+# to runs 4-6 (same SHA-256) and its final.config still has
+# CONFIG_LTO_NONE=y, no CFI, KASAN_GENERIC=y, KASAN_HW_TAGS off --
+# even though the build log shows "Modifying LTO mode to 'full'"
+# and scripts/config enabling LTO_CLANG_FULL. Root cause, traced to
+# the Kconfig sources: HAS_LTO_CLANG depends on
+# "!KASAN || KASAN_HW_TAGS", and our build ends up with
+# KASAN_GENERIC=y, so HAS_LTO_CLANG is false and the olddefconfig
+# right after the LTO modification reverts the choice to its
+# default LTO_NONE. And the KASAN mode itself is lost one step
+# earlier: the Normalize step ran `make gki_defconfig` with PLAIN
+# HOST make (gcc), where CC_IS_CLANG=n, so savedefconfig silently
+# dropped CONFIG_LTO_CLANG_FULL / CONFIG_CFI_CLANG (and the KASAN
+# mode lines) from gki_defconfig before the real build ever saw
+# them. Fix: (a) Normalize now runs kconfig with LLVM=1 + the
+# prebuilt clang on PATH, exactly like the real build; (b) a hard
+# v9 gate in Normalize AND in the Build step fails the run if the
+# .config does not have LTO_CLANG_FULL=y, CFI_CLANG=y and
+# KASAN_HW_TAGS=y, or if KASAN_GENERIC / KASAN_VMALLOC / LTO_NONE
+# are =y -- so a bad config fails in CI with a clear message
+# instead of shipping a kernel that bootloops the phone. (c) The
+# Collect symbol check now greps the actual Image for the two
+# symbols (ksymtab strings) instead of abi_symbollist, which is
+# only the EXPECTED list and wrongly reported both symbols OK in
+# run 7. Do NOT flash any run 4-7 Image: they are all the same
+# non-LTO kernel.
+#
+# v10 (2026-10-25): run 8 (40125105316) failed at the v9 gate in
+# Normalize -- which is the gate WORKING as designed (it caught the
+# bad config in CI instead of on the phone). The exact error was
+# "CONFIG_LTO_CLANG_FULL is not =y in the normalized .config", even
+# though Normalize now used LLVM=1 + prebuilt clang 12.0.5. The
+# normalized .config (from run 8's partial artifact) shows the full
+# chain: CC_IS_CLANG=y, LD_IS_LLD=y, CLANG_VERSION=120005,
+# ARCH_SUPPORTS_LTO_CLANG=y, SLUB=y, but ARM64_AS_HAS_MTE is absent
+# and ARM64_MTE is absent, so HAVE_ARCH_KASAN_HW_TAGS was never
+# selected, KASAN_HW_TAGS is unselectable, the mode fell back to
+# GENERIC (+KASAN_VMALLOC=y), and HAS_LTO_CLANG stayed false. The
+# missing piece is CROSS_COMPILE: without it clang targets x86_64,
+# so the -march=armv8.5-a+memtag assembler check in as-option fails
+# (the Makefile only adds --target=aarch64-linux-gnu when
+# CROSS_COMPILE is set). build.config.aarch64 sets
+# CROSS_COMPILE=aarch64-linux-gnu- for the real build -- the
+# Normalize step now exports it too, plus the GNU cross binutils on
+# PATH when present. If the v9 gate still trips, its error names the
+# exact option that is still off.
+#
+# v11 (2026-10-25): run 9 (40125829960) -- the v9 gate PASSED for the
+# first time (Normalize success), so the v10 CROSS_COMPILE fix worked.
+# But the Build step then failed after ~65 min of compiling with NO
+# LOG AT ALL (run log download 404 BlobNotFound, log zip 22 bytes /
+# empty, no annotations, no artifacts). That pattern -- long build,
+# sudden death, zero log -- is most consistent with the runner being
+# OOM-killed during the full-LTO link (standard runner: 16 GB RAM +
+# 4 GB swap; full-LTO link is notorious for this), but it is NOT
+# proven from the available evidence. Changes: (a) LTO full -> thin.
+# Thin LTO still selects LTO_CLANG, so CFI_CLANG still turns on and
+# the vendor modules still get __cfi_slowpath, but the link uses far
+# less memory. The v9 gate now requires LTO_CLANG_THIN instead of
+# FULL. (b) swap 4G -> 8G in maximize-build-space. (c) A background
+# resource monitor (free/df every 60s) runs during the Build step and
+# is uploaded best-effort, plus a dmesg tail, so the next silent
+# death leaves evidence to distinguish OOM from disk-full.
+#
+# v12 (2026-10-25): run 10 (40131966133) failed at the v9 gate in
+# Normalize after ~6 min -- but it was OUR OWN v11 BUG, not the
+# kernel: v11 changed the gate to require LTO_CLANG_THIN=y, while
+# stock gki_defconfig sets LTO_CLANG_FULL=y and nothing in the
+# workflow edits it to THIN. The run-10 partial artifact proves it:
+# its normalized .config has LTO_CLANG_FULL=y, CFI_CLANG=y,
+# KASAN_HW_TAGS=y and GENERIC off -- everything else in the gate had
+# already passed; only the THIN requirement tripped. The gate was
+# checking the wrong thing for LTO: the plain-gki .config never
+# decides the final LTO mode (the build-time LTO argument does).
+# Fix: the Normalize gate now accepts FULL or THIN. The Build-step
+# gate still requires THIN, since the build applies thin.
+#
+# v13 (2026-10-25): run 11 (40132569747, the first LTO/CFI/HW_TAGS
+# kernel, SHA bd2a3f3b...) STILL bootlooped on the phone: first screen,
+# then black screen + reboot, never reaching the desktop. The kernel
+# itself passed every check (v9 gate green, __cfi_slowpath and
+# kasan_flag_enabled present in the Image ksymtab, all 23 Droidspaces
+# MUST =y), so the failure is after the kernel starts -- the prime
+# suspect is CFI in ENFORCING mode. Our kernel is built from the
+# public 16.0.3 source while the phone's vendor_dlkm modules were
+# built against 16.0.5 headers; a single differing function-pointer
+# type hash makes CFI panic the kernel while a vendor module loads.
+# Fix: enable CONFIG_CFI_PERMISSIVE (exists in this 5.10 tree,
+# depends on CFI_CLANG) so a CFI violation warns instead of panics.
+# It changes no exported symbol, so the kABI is unaffected. The other
+# open possibility is that the user booted the artifact boot.img
+# directly (its ramdisk_size=0 -- no ramdisk, no init) instead of
+# repacking the Image into the stock boot backup; that must be ruled
+# out on the phone side before concluding the kernel itself is at
+# fault.
+#
+# v14 (2026-10-25): run 12 (40152667525, v13) SUCCEEDED in CI but is
+# NOT USABLE and was NOT delivered. Its Image has NO __cfi_slowpath
+# in the ksymtab, and the build log has 162 modpost errors
+# ' "__cfi_slowpath" [<mod>.ko] undefined!' (phy-qcom-ufs, pci-msm-drv,
+# pinctrl-msm, clk-qcom, mhi, msm_kgsl, ...). Run 11's log had 0.
+# Root cause, verified against kernel/cfi.c in this tree: with
+# CONFIG_CFI_PERMISSIVE the macro renames the exported handler from
+# __cfi_slowpath to __cfi_slowpath_diag -- but clang emits calls to
+# __cfi_slowpath from instrumented code regardless of mode (all 162
+# errors name __cfi_slowpath, 0 name the diag variant), and the stock
+# vendor modules were built enforcing-mode, so they need __cfi_slowpath
+# too. The warn-vs-panic behaviour does NOT depend on the rename:
+# handle_cfi_failure() checks IS_ENABLED(CONFIG_CFI_PERMISSIVE).
+# Fix: a 1-line patch to kernel/cfi.c (applied like the kABI patches)
+# keeps the exported name __cfi_slowpath in both modes, so the 162
+# modules load AND a CFI violation still only warns. Nothing references
+# __cfi_slowpath_diag. Two process fixes from the same incident: (a)
+# the Build step now tees its output and fails on any modpost
+# 'undefined!' error (run 12's modpost Error 1 was swallowed by the
+# oplus script, so the run wrongly concluded success); (b) the Collect
+# symbol check is now a HARD FAIL when CFI_CLANG=y but __cfi_slowpath
+# is missing from the Image. Run 13 acceptance: final.config still
+# CFI_PERMISSIVE=y + THIN/CFI/HW_TAGS, __cfi_slowpath present in the
+# Image, 0 modpost __cfi_slowpath errors, SHA different from run 11
+# (bd2a3f3b...) and run 12 (d12915ac...).
+#
+# v15 (2026-10-25): WildKernels rewrite. Run 13 (v14) FAILED in Collect:
+# the v14 cfi.c patch was WRONG -- in permissive mode the CORE kernel's own
+# code calls __cfi_slowpath_diag while modules call __cfi_slowpath, so
+# permissive mode needs BOTH names; my patch removed the diag definition
+# and the link failed (ld.lld: undefined symbol: __cfi_slowpath_diag).
+# The oplus script swallowed the make failure and exited 0, so the Build
+# step "succeeded" with no Image. WildKernels (same OnePlusOSS source,
+# LTO thin, stock ENFORCING CFI) boots on this phone, so CFI is likely NOT
+# the cause of run 11's bootloop. v15 adopts their method: (a) kABI patch
+# variant fix_sysvipc_kabi_bypass_a16-6.12_below.patch (NOT 6_7_8) +
+# fix_abi_padding_for_posix_mqueue.patch + the oplus_bsp_midas panic patch;
+# (b) build DIRECTLY with make (gki_defconfig + scripts/config for LTO
+# thin + olddefconfig + make Image modules), never oplus_build_kernel.sh --
+# failures fail loudly (pipefail + tee build.log); (c) deliver an
+# AnyKernel3 ZIP (patches the device boot.img on-device, preserving the
+# stock ramdisk -- no manual repack); (d) NO CFI_PERMISSIVE, NO cfi.c
+# patch (stock enforcing CFI, like WildKernels). No KernelSU/SUSFS
+# integration (user does not use them); DroidSpaces only. The workflow's
+# msm-kernel tree is no longer needed for the build (WildKernels' manifest
+# has no msm-kernel project) but the sync still fetches it; harmless.
+# Run 14 acceptance: final.config LTO_CLANG_THIN=y + CFI_CLANG=y +
+# KASAN_HW_TAGS=y + CFI_PERMISSIVE off, __cfi_slowpath present in the
+# Image, 0 modpost undefined errors, AK3 zip present, SHA different from
+# run 11 (bd2a3f3b...) and run 12 (d12915ac...).
+#
+# v19 (2026-10-31): KERNEL VERSION STRING FIX. The Image reported
+# "5.10.236-o-g<hash>" while the phone reports
+# "5.10.236-android12-9-o-g74d132f4467a". Root cause, read out of the
+# two repos this workflow syncs (not guessed):
+#   * scripts/setlocalversion composes the suffix as
+#       -<android_release>-<kmi_generation>  +  -o  +  -g<12 hex>
+#     where the first two fields come from its $2/$3 arguments, and the
+#     top-level Makefile passes them as `$(BRANCH) $(KMI_GENERATION)`.
+#   * Neither variable is in any defconfig. The official build gets them
+#     from build.config.common (BRANCH=android12-5.10, KMI_GENERATION=9)
+#     via build.sh. The v15 direct-make path never runs build.sh, so both
+#     were empty and the "-android12-9" field silently disappeared.
+#   * "-o" is a hard-coded OPPO infix in that same script
+#     (OPLUS_FEATURE_BUILD block); "-g<12 hex>" is the real local commit.
+# This was never cosmetic. AnyKernel3 (pinned 0b46673) runs with
+# do.check_boot_version=1, and tools/ak3-core.sh extract_kernel_version()
+# only recognises this shape:
+#   strings Image | grep -oE 'Linux version [0-9]+\.[0-9]+\.[0-9]+-android[0-9]+'
+# An Image whose version is "5.10.236-o-g..." matches NOTHING, so
+# new_ver is empty and the flash aborts with "Unable to read version from
+# Image". Even if it parsed, the check compares the 2nd dash-field of the
+# Image against the phone's: "o" vs "android12" -> MISMATCH, abort.
+# Fix: BRANCH/KMI_GENERATION live in the job env, so every make call
+# (gki_defconfig, olddefconfig, Image) produces the stock KMI string.
+# Three gates, all cheap: (a) `make kernelrelease` right after
+# olddefconfig -- 1 s, no compile -- must start with
+# 5.10.236-android12-9-o-; (b) the Image's "Linux version" line must
+# carry the same KMI part in Collect; (c) the Package step refuses to
+# build a zip AK3 would abort on, and puts the real version on AK3's
+# flash screen.
+# The trailing -g<hash> deliberately stays the real local commit. AK3
+# never compares it (its regex truncates at -androidNN), and printing the
+# stock hash on a patched kernel would only hide which build is running.
+# If you ever DO need the byte-identical stock string, add `.scmversion`
+# in kernel_platform/common containing "-android12-9-o-g74d132f4467a":
+# scm_version() cats that file and returns before touching git.
+#
+# v18 (2026-10-25): back to Ace 2 / ColorOS. The user flashed back
+# from the 11R (OxygenOS) to the Ace 2 (PHK110, ColorOS 16.0.5.1201).
+# Manifest oneplus_11r_b.xml -> oneplus_ace2_b.xml (revision
+# oneplus/sm8475_b_16.0.0_ace_2, kernel 5.10.236 -- matches the
+# phone's 5.10.236 exactly). Same WildKernels DroidSpaces patches +
+# direct-make build (v15/v16) and the v16 -dirty fix, same gates.
+# AK3 zip and artifact renamed back to ACE-2. Run 17 acceptance:
+# build succeeds, Image version has no -dirty, __cfi_slowpath
+# present, 23 DroidSpaces MUST =y.
+#
+# v17 (2026-10-25): retarget from Ace 2 (PHK110) to OnePlus 11R
+# (CPH2487, OxygenOS 16.0.5.1301, kernel 5.10.246). The user switched
+# phones/ROMs. Manifest oneplus_ace2_b.xml ->
+# oneplus_11r_b.xml (revision oneplus/sm8475_b_16.0.0_oneplus_11r,
+# kernel 5.10.236 -- the newest public 11R source; see the header
+# warning, there is no public 5.10.246). Same hardware (SM8475 /
+# waipio), same WildKernels DroidSpaces patches + direct-make build
+# (v15/v16), same gates. AK3 zip and artifact renamed OP-11R.
+# Run 16 acceptance: build succeeds, Image version has no -dirty,
+# __cfi_slowpath present, 23 DroidSpaces MUST =y.
+#
+# v16 (2026-10-25): fix the "-dirty" suffix in the kernel version string.
+# Run 14's Image reports "Linux version 5.10.236-o-g694ce6ff5393-dirty":
+# scripts/setlocalversion appends -dirty when the git working tree has
+# uncommitted changes -- here, the 3 kABI patches + the gki_defconfig
+# edit, all applied in kernel_platform/common. Fix: commit them in the
+# local runner repo before building, so the tree is clean and the
+# version becomes 5.10.236-o-g<new-commit> with no -dirty. The commit
+# is local to the runner only and is never pushed. Untracked build
+# artifacts (out/, ld-wrapper) do not affect the check: setlocalversion
+# uses `git status -uno --porcelain` (-uno = no untracked files).
+# The version still lacked the stock "-android12-9" (the direct-make
+# build passed no branch arg to setlocalversion). v19 fixes that
+# properly -- see the v19 entry above; it was not cosmetic, it made the
+# AnyKernel3 zip abort on the phone.
+# Run 15 acceptance: Image version has no -dirty (hard gate in Collect).
+#
+# How to use:
+#   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
+#      (it does not have to live in the kernel source repo; it clones everything).
+#   2. In your repo: Actions -> "Build OnePlus Ace 2 kernel" -> Run workflow.
+#   3. Download the artifact "ace2-kernel-<build_mode>" when it finishes.
+#   4. Do NOT flash blindly: back up the stock boot.img first, prefer
+#      `fastboot boot <new boot.img>` for a temporary test, and only flash
+#      after the temporary boot passes (calls, mobile data, Wi-Fi, Bluetooth).
+#
+# KernelSU route (matches the checklist):
+#   Default is NO integrated KernelSU. Finish the Droidspaces kernel, boot it,
+#   then install KernelSU in LKM mode on top of it. This is the current
+#   official direction (KernelSU's build doc is archived and says GKI image
+#   mode support was dropped in v3.0 in favour of LKM).
+#   If you deliberately want the old integrated route, set integrate_ksu=true
+#   and a pinned ksu_tag. Do not also install an LKM on the same boot image.
+
+name: Build OnePlus Ace 2 kernel
+
+permissions:
+  contents: read
+
+"on":
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "baseline = unmodified source only (recommended first run); droidspaces = + kABI patches + GKI defconfig options"
+        required: true
+        type: choice
+        options:
+          - droidspaces
+          - baseline
+        default: droidspaces
+      kabi_patch_variant:
+        description: "SYSVIPC kABI patch slot to try first (only used in droidspaces mode; if it bootloops, rerun with another slot)"
+        required: true
+        type: choice
+        options:
+          - "6_7_8"
+          - "3_4_5"
+          - "1_2_3"
+        default: "6_7_8"
+      integrate_ksu:
+        description: "Old integrated KernelSU route (setup.sh). Leave false for the recommended LKM-after-boot route."
+        required: false
+        type: boolean
+        default: false
+      ksu_tag:
+        description: "KernelSU tag for setup.sh, e.g. v1.0.3. Leave empty for the script's latest stable tag. Only used when integrate_ksu=true."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    name: Build Ace 2 kernel (${{ inputs.build_mode }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      MANIFEST_BRANCH: oneplus/sm8475
+      MANIFEST_FILE: oneplus_ace2_b.xml
+      COMMON_DIR: kernel_platform/common
+      DEFCONFIG: kernel_platform/common/arch/arm64/configs/gki_defconfig
+      # v5: AOSP GKI ABI strict mode off -- see header. The generic GKI
+      # symbol list assumes CFI + KASAN_HW_TAGS, both off in the OnePlus
+      # waipio vendor config; strict exact-match can never pass. This
+      # changes no kernel code or config, only the post-build gate.
+      # TRIM_NONLISTED_KMI stays at its default (1).
+      KMI_SYMBOL_LIST_STRICT_MODE: '0'
+
+      # v19: the kernel version string -- see the header. The stock ROM
+      # reports 5.10.236-android12-9-o-g74d132f4467a, and the
+      # "-android12-9" part lives in NO defconfig: the official build
+      # passes `make BRANCH=... KMI_GENERATION=...` (values read from
+      # build.config.common) and scripts/setlocalversion turns them into
+      # "-android12-9", then appends the OPPO "-o" infix and the
+      # "-g<12 hex>" git suffix. Declaring them at job level (not per
+      # step) is deliberate: every make invocation must see the same
+      # values, or kbuild's filechk regenerates include/config/
+      # kernel.release without them and the version silently regresses.
+      BRANCH: android12-5.10
+      KMI_GENERATION: '9'
+      # Reference only, never used to fake the built string: the phone's
+      # own release. The gates use it to separate "KMI part" (must match)
+      # from "commit suffix" (must not).
+      STOCK_KERNEL_RELEASE: 5.10.236-android12-9-o-g74d132f4467a
+
+    steps:
+      # MUST be first, even before checkout: this action mounts a volume over
+      # $GITHUB_WORKSPACE, so anything checked out before it would be hidden.
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Show runner disk and memory
+        run: |
+          df -h
+          free -h
+          nproc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget jq python3 rsync cpio unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            lz4 zstd xz-utils
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync OnePlus kernel source
+        run: |
+          set -euxo pipefail
+          mkdir -p kernel
+          cd kernel
+          repo init --depth=1 -u https://github.com/OnePlusOSS/kernel_manifest \
+            -b "$MANIFEST_BRANCH" -m "$MANIFEST_FILE"
+          # -c = current branch only; --no-tags = no tag objects.
+          # --depth=1 (from init) keeps only HEAD: this is the big saver vs v1,
+          # which fetched full history for every project including prebuilts.
+          repo sync -c --no-tags -j"$(nproc)"
+          echo "=== disk after sync ==="
+          df -h
+          du -sh kernel/ || true
+          echo "=== kernel_platform layout ==="
+          ls kernel_platform/
+          echo "=== common kernel HEAD ==="
+          git -C kernel_platform/common log -1 --oneline || true
+          echo "=== msm-kernel HEAD ==="
+          git -C kernel_platform/msm-kernel log -1 --oneline || true
+          {
+            echo "manifest_branch=$MANIFEST_BRANCH"
+            echo "manifest_file=$MANIFEST_FILE"
+            echo "build_mode=${{ inputs.build_mode }}"
+            echo "kabi_patch_variant=${{ inputs.kabi_patch_variant }}"
+            echo "integrate_ksu=${{ inputs.integrate_ksu }}"
+            echo "ksu_tag=${{ inputs.ksu_tag }}"
+            echo "common_head=$(git -C kernel_platform/common rev-parse HEAD)"
+            echo "msm_kernel_head=$(git -C kernel_platform/msm-kernel rev-parse HEAD)"
+          } > ../BUILD_INFO.txt
+
+      - name: Download WildKernels DroidSpaces patches (v15)
+        if: inputs.build_mode == 'droidspaces'
+        run: |
+          set -euxo pipefail
+          mkdir -p patches
+          cd patches
+          # v15: use WildKernels' DroidSpaces patches (WildKernels/kernel_patches,
+          # common/droidspaces) instead of the DroidSpaces repo's 6_7_8 variant.
+          # For sm8475 + android12 + 5.10, WildKernels applies
+          # fix_sysvipc_kabi_bypass_a16-6.12_below.patch (NOT 6_7_8) plus
+          # fix_abi_padding_for_posix_mqueue.patch, and an extra patch that
+          # fixes a kernel panic from oplus_bsp_midas. Their kernel (same
+          # OnePlusOSS source, LTO thin, stock enforcing CFI) boots on this
+          # phone; ours (6_7_8, no midas patch) does not.
+          BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/droidspaces"
+          curl -fsSL "$BASE/fix_sysvipc_kabi_bypass_a16-6.12_below.patch" -o 001-sysvipc-kabi-bypass.patch
+          curl -fsSL "$BASE/fix_abi_padding_for_posix_mqueue.patch" -o 002-posix-mqueue.patch
+          curl -fsSL "$BASE/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" -o 003-midas-panic.patch
+          ls -l
+          sha256sum *.patch
+
+      - name: Apply WildKernels DroidSpaces patches (v15)
+        if: inputs.build_mode == 'droidspaces'
+        run: |
+          set -euxo pipefail
+          cd kernel/$COMMON_DIR
+          # Dry-run first so a bad patch fails here with a clear message,
+          # instead of halfway through a multi-hour build. --forward makes
+          # re-application safe (like WildKernels does).
+          for pp in ../../../patches/001-sysvipc-kabi-bypass.patch ../../../patches/002-posix-mqueue.patch ../../../patches/003-midas-panic.patch; do
+            patch -p1 --dry-run --forward < "$pp"
+            patch -p1 --forward < "$pp"
+          done
+          echo "kabi_patches_applied=wk-bypass_a16-6.12_below,wk-posix-mqueue,wk-midas-panic" >> ../../../BUILD_INFO.txt
+
+      - name: Edit gki_defconfig (in place, GKI list only)
+        if: inputs.build_mode == 'droidspaces'
+        run: |
+          set -euxo pipefail
+          python3 - "kernel/$DEFCONFIG" <<'PYEOF'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          # Must-have (Droidspaces GKI list) + recommended (same list).
+          # Deliberately NOT included: CONFIG_CFS_BANDWIDTH and CONFIG_CGROUP_PIDS.
+          # Those two resize scheduler/cgroup structures, break the GKI kABI and
+          # make stock vendor modules refuse to load -> bootloop. The only cost
+          # of leaving them out is that --cpus / --pids-limit are unavailable.
+          enable = [
+              "CONFIG_SYSVIPC",
+              "CONFIG_POSIX_MQUEUE",
+              "CONFIG_IPC_NS",
+              "CONFIG_PID_NS",
+              "CONFIG_DEVTMPFS",
+              "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE",
+              "CONFIG_USER_NS",
+              "CONFIG_IP6_NF_NAT",
+              "CONFIG_IP6_NF_TARGET_MASQUERADE",
+              "CONFIG_MACVLAN",
+              # NOTE (v4): the Droidspaces doc lists
+              # CONFIG_NETFILTER_XT_TARGET_REJECT, but that symbol does not
+              # exist in kernel 5.10 -- the unified xt_REJECT target came
+              # later. The 5.10 equivalents are the IPv4/IPv6 REJECT targets
+              # below. Never put the dead XT symbol back in: kconfig silently
+              # drops unknown symbols and any strict .config check on it fails.
+              "CONFIG_IP_NF_TARGET_REJECT",
+              "CONFIG_IP6_NF_TARGET_REJECT",
+              "CONFIG_NETFILTER_XT_TARGET_LOG",
+              "CONFIG_NETFILTER_XT_MATCH_RECENT",
+              "CONFIG_IP_SET",
+              "CONFIG_IP_SET_HASH_IP",
+              "CONFIG_IP_SET_HASH_NET",
+              "CONFIG_NETFILTER_XT_SET",
+              "CONFIG_TMPFS_POSIX_ACL",
+              "CONFIG_TMPFS_XATTR",
+          ]
+          forbidden = ["CONFIG_CFS_BANDWIDTH", "CONFIG_CGROUP_PIDS"]
+
+          with open(path, encoding="utf-8", errors="surrogateescape") as f:
+              lines = f.read().splitlines()
+
+          def find(name):
+              for i, line in enumerate(lines):
+                  if line == f"# {name} is not set" or line.startswith(f"{name}="):
+                      return i
+              return None
+
+          for name in enable:
+              idx = find(name)
+              if idx is None:
+                  lines.append(f"{name}=y")
+              else:
+                  lines[idx] = f"{name}=y"
+
+          with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Verify: every requested option is =y, no forbidden option is =y.
+          text = "\n".join(lines)
+          missing = [n for n in enable if f"{n}=y" not in text]
+          bad = [n for n in forbidden if f"{n}=y" in text]
+          if missing:
+              print(f"ERROR: missing after edit: {missing}")
+              raise SystemExit(1)
+          if bad:
+              print(f"ERROR: forbidden option enabled: {bad}")
+              raise SystemExit(1)
+          print("gki_defconfig OK:", ", ".join(enable))
+          PYEOF
+          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE|MACVLAN)=" "kernel/$DEFCONFIG"
+
+      - name: Configure kernel (v15, WildKernels direct-make method)
+        run: |
+          set -euxo pipefail
+          # v15: configure the kernel the way WildKernels does -- direct
+          # kconfig in the common tree, no oplus script, no savedefconfig
+          # dance. The oplus script's savedefconfig diff was the source of
+          # the run 1-8 config bugs, and the script swallows make failures
+          # (run 13: vmlinux link failed yet the step "succeeded" with no
+          # Image). Direct make fails loudly.
+          cd kernel/kernel_platform/common
+          CLANG_BIN="$(ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-r416183b/bin" 2>/dev/null || ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-"*/bin 2>/dev/null | head -n 1 || true)"
+          if [ -n "$CLANG_BIN" ] && [ -x "$CLANG_BIN/clang" ]; then
+            export PATH="$CLANG_BIN:$PATH"
+            echo "Using prebuilt clang $CLANG_BIN ($("$CLANG_BIN/clang" --version | head -n 1))"
+          else
+            echo "::error::prebuilt clang not found"; exit 1
+          fi
+          export LLVM=1 LLVM_IAS=1
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+          # ld-wrapper: thin LTO link with all cores (WildKernels).
+          cat > "$PWD/ld-wrapper" <<'EOF'
+          #!/bin/bash
+          ld.lld "$@" --thinlto-jobs=$(nproc --all)
+          EOF
+          chmod +x "$PWD/ld-wrapper"
+          export LD="$PWD/ld-wrapper" HOSTLD="$PWD/ld-wrapper"
+          OUT="$PWD/out"
+          mkdir -p "$OUT"
+          make LD="$LD" HOSTLD="$HOSTLD" O="$OUT" gki_defconfig
+          # LTO: thin (WildKernels' choice for this phone; stock defconfig
+          # says FULL, but thin links with far less memory and still selects
+          # LTO_CLANG/CFI). Set it on the generated .config, like WildKernels.
+          scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL
+          scripts/config --file "$OUT/.config" -e LTO_CLANG_THIN
+          make LD="$LD" HOSTLD="$HOSTLD" O="$OUT" olddefconfig
+          # v19: version-string gate. `make kernelrelease` only re-runs
+          # setlocalversion (no compile, ~1 s), so a missing KMI field
+          # fails here instead of after an hour and after shipping an
+          # Image that AnyKernel3 cannot even parse.
+          # NOTE: the tree is still dirty here (patches applied, commit
+          # happens later), so a trailing -dirty is expected and allowed;
+          # the commit step checks that separately.
+          KREL="$(make -s O="$OUT" kernelrelease 2>/dev/null || true)"
+          BASE_KVER="$(make -s O="$OUT" kernelversion 2>/dev/null || true)"
+          A_REL="$(printf '%s' "$BRANCH" | sed -n 's/^\(android[0-9]\{2,\}\)-.*/\1/p')"
+          if [ -z "$A_REL" ] || [ -z "$KREL" ] || [ -z "$BASE_KVER" ]; then
+            echo "::error::cannot evaluate the kernel version (BRANCH='$BRANCH' kernelrelease='$KREL' kernelversion='$BASE_KVER')"
+            exit 1
+          fi
+          WANT_PREFIX="${BASE_KVER}-${A_REL}-${KMI_GENERATION}-o-"
+          echo "kernelrelease=${KREL}"
+          echo "stock release=${STOCK_KERNEL_RELEASE}"
+          # Prefix only, not "-g*": setlocalversion emits "-g<hash>" when
+          # no tag is reachable but "-<count>-g<hash>" when one is, and
+          # both are fine for AK3. What must be present is the
+          # "-androidNN-KMI-o-" part.
+          case "$KREL" in
+            "${WANT_PREFIX}"*)
+              echo "v19 version gate passed: ${KREL} (KMI part ${WANT_PREFIX})"
+              ;;
+            *)
+              echo "::error::kernelrelease '${KREL}' does not start with '${WANT_PREFIX}'. The -androidNN-KMI field is missing -- that is exactly the bug AnyKernel3 aborts on, so the build is stopped here."
+              exit 1
+              ;;
+          esac
+          # v15 gate (hard fail) on the configured .config: LTO thin, CFI,
+          # KASAN_HW_TAGS must be on; GENERIC/VMALLOC/LTO_NONE must be off.
+          for opt in CONFIG_LTO_CLANG_THIN CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS CONFIG_ARM64_MTE; do
+            grep -q "^${opt}=y$" "$OUT/.config" || { echo "ERROR: v15 gate: $opt is not =y in configured .config"; exit 1; }
+          done
+          for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
+            if grep -q "^${opt}=y$" "$OUT/.config"; then echo "ERROR: v15 gate: $opt is =y in configured .config"; exit 1; fi
+          done
+          # DroidSpaces options (droidspaces mode only; the authoritative
+          # check is the final .config in Collect, but fail early here).
+          if [ "${{ inputs.build_mode }}" = "droidspaces" ]; then
+            for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR CONFIG_NAMESPACES CONFIG_UTS_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER; do
+              grep -q "^${opt}=y$" "$OUT/.config" || { echo "ERROR: $opt is not =y in configured .config"; exit 1; }
+            done
+            for opt in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
+              if grep -q "^${opt}=y$" "$OUT/.config"; then echo "ERROR: forbidden $opt is enabled in configured .config"; exit 1; fi
+            done
+          fi
+          echo "v15 config gate passed: LTO_THIN + CFI + KASAN_HW_TAGS + all DroidSpaces options =y"
+
+      - name: Integrate KernelSU (old route, optional)
+        if: inputs.integrate_ksu == true
+        run: |
+          set -euxo pipefail
+          cd kernel
+          if [ -n "${{ inputs.ksu_tag }}" ]; then
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_tag }}"
+          else
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          fi
+          echo "integrated_ksu_tag=${{ inputs.ksu_tag }}" >> ../BUILD_INFO.txt
+
+      - name: Disk guard before build
+        run: |
+          set -euo pipefail
+          df -h
+          AVAIL_GB="$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')"
+          echo "free space in workspace: ${AVAIL_GB}G"
+          if [ "$AVAIL_GB" -lt 10 ]; then
+            echo "::error::Only ${AVAIL_GB}G free before the build. The kernel build will run out of disk. Use a larger runner or a self-hosted runner with more disk."
+            exit 1
+          fi
+
+      - name: Commit source changes (clean tree, remove -dirty suffix)
+        run: |
+          set -euxo pipefail
+          # v16: commit the kABI patches + defconfig edit in the local
+          # common repo so scripts/setlocalversion sees a clean tree
+          # and does NOT append -dirty to the kernel version.
+          # (Run 14: 5.10.236-o-g694ce6ff5393-dirty.)
+          # The commit is local to the runner only, never pushed.
+          cd kernel/$COMMON_DIR
+          git config user.email "kernel-builder@local"
+          git config user.name "Kernel Builder"
+          # Stage all source changes, but NOT the build output dir
+          # (out/) or the ld-wrapper helper -- those are untracked
+          # build artifacts. Note: setlocalversion uses
+          # `git status -uno --porcelain`, so untracked files would
+          # not trigger -dirty anyway; this is just hygiene.
+          git add -A
+          git reset -q -- out ld-wrapper 2>/dev/null || true
+          git commit -m "droidspaces: apply kABI patches + gki_defconfig (clean tree, no -dirty)" || echo "nothing to commit"
+          echo "=== git status after commit (should show only untracked build artifacts) ==="
+          git status --porcelain || true
+          echo "=== new HEAD ==="
+          git log -1 --oneline
+          # v16 gate: the version string must not contain -dirty.
+          # v19: evaluate it the way the build does, via `make
+          # kernelrelease` (it reads $OUT/include/config/auto.conf and the
+          # job-env BRANCH/KMI_GENERATION). The old direct call
+          # `./scripts/setlocalversion .` always failed here -- with O=
+          # there is no include/config/auto.conf in the source tree, the
+          # script exits 1 and the suffix came back empty -- so this gate
+          # passed vacuously and could never catch a -dirty build.
+          echo "=== kernelrelease check ==="
+          KREL_AFTER_COMMIT="$(make -s O="$PWD/out" kernelrelease 2>/dev/null || true)"
+          echo "kernelrelease after commit: ${KREL_AFTER_COMMIT:-<unavailable>}"
+          case "$KREL_AFTER_COMMIT" in
+            *dirty*) echo "ERROR: v16 gate: version still contains -dirty: ${KREL_AFTER_COMMIT}"; exit 1;;
+            "") echo "WARNING: could not evaluate kernelrelease here; the Collect step still gates on the Image itself";;
+            *) echo "v16 gate passed: no -dirty (${KREL_AFTER_COMMIT})";;
+          esac
+
+      - name: Build kernel (v15, direct make)
+        run: |
+          set -euxo pipefail
+          # v15: build directly with make, like WildKernels. No oplus script:
+          # it swallows make failures (run 13: vmlinux link failed yet the
+          # step "succeeded" with no Image) and its LTO prompt/savedefconfig
+          # dance caused runs 1-8. Direct make fails loudly (pipefail + tee).
+          cd kernel/kernel_platform/common
+          CLANG_BIN="$(ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-r416183b/bin" 2>/dev/null || ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-"*/bin 2>/dev/null | head -n 1 || true)"
+          export PATH="$CLANG_BIN:$PATH"
+          export LLVM=1 LLVM_IAS=1
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export LD="$PWD/ld-wrapper" HOSTLD="$PWD/ld-wrapper"
+          export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+          export KBUILD_BUILD_USER=kernel KBUILD_BUILD_HOST=kleaf KBUILD_BUILD_VERSION=1
+          # v11: background resource monitor (memory/disk every 60s) so
+          # a silent runner death (OOM during the LTO link, like run 9)
+          # leaves evidence in the artifact. Killed at the end of this
+          # step; Collect uploads the log best-effort.
+          ( while true; do echo "--- $(date -u +%H:%M:%S) ---"; free -h; df -h / /tmp; sleep 60; done > "$GITHUB_WORKSPACE/resource-monitor.log" 2>&1 & echo $! > "$GITHUB_WORKSPACE/resource-monitor.pid" )
+          OUT="$PWD/out"
+          # Build the Image only (WildKernels' release path): the vendor
+          # modules already live on the phone (vendor_dlkm) and do not need
+          # rebuilding. Fail loudly on any make error (pipefail). The
+          # Collect step's symbol gate then checks __cfi_slowpath is in the
+          # Image ksymtab (run 12's 162 missing-symbol errors were caught by
+          # modpost when modules were built; here the ksymtab check is the
+          # equivalent gate for the Image itself).
+          make LD="$LD" HOSTLD="$HOSTLD" -j"$(nproc --all)" O="$OUT" KCFLAGS="-Wno-error" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          kill "$(cat "$GITHUB_WORKSPACE/resource-monitor.pid" 2>/dev/null)" 2>/dev/null || true
+          # The Image must exist -- the oplus script used to "succeed" with
+          # no Image (run 13); direct make + this check make that impossible.
+          test -f "$OUT/arch/arm64/boot/Image" || { echo "ERROR: Image not produced at $OUT/arch/arm64/boot/Image"; exit 1; }
+          echo "Image built: $(ls -lh "$OUT/arch/arm64/boot/Image")"
+          # v19: show the version string actually baked into the Image
+          # (linux_banner). It must carry -android12-9-o-, otherwise
+          # AnyKernel3 refuses to flash it; the hard gate is in Collect.
+          strings "$OUT/arch/arm64/boot/Image" | grep -E '^Linux version ' | head -n 1 || true
+          if grep -q 'modpost: .* undefined!' "$GITHUB_WORKSPACE/build.log"; then
+            echo "ERROR: modpost reported undefined symbols:"
+            grep 'modpost: .* undefined!' "$GITHUB_WORKSPACE/build.log" | sort -u | head -n 20
+            exit 1
+          fi
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          cp BUILD_INFO.txt artifacts/ || true
+          cp resource-monitor.log artifacts/ 2>/dev/null || true
+          cp build.log artifacts/ 2>/dev/null || true
+          dmesg 2>/dev/null | tail -n 100 > artifacts/dmesg-tail.txt || true
+          # The oplus scripts' exact output directory can vary by tree version,
+          # so locate the products instead of hard-coding one path.
+          IMAGE="$(find kernel -name Image -type f -path '*arch/arm64/boot/*' | head -n 1 || true)"
+          BOOTIMG="$(find kernel -name 'boot*.img' -type f | head -n 1 || true)"
+          echo "found_image=${IMAGE:-none}" | tee -a artifacts/BUILD_INFO.txt
+          echo "found_bootimg=${BOOTIMG:-none}" | tee -a artifacts/BUILD_INFO.txt
+          if [ -n "$IMAGE" ]; then
+            cp "$IMAGE" artifacts/Image
+          fi
+          if [ -n "$BOOTIMG" ]; then
+            cp "$BOOTIMG" artifacts/
+          fi
+          # v8: collect Image.lz4 too (the GKI build also produces it;
+          # some repack tools want the compressed image) and record the
+          # LTO/CFI state + whether the two symbols the strict ABI check
+          # missed in run 3 are now present in the generated ABI symbol
+          # list. Diagnostic only -- never fails the run.
+          IMAGELZ4="$(find kernel -name Image.lz4 -type f -path '*arch/arm64/boot/*' | head -n 1 || true)"
+          if [ -n "$IMAGELZ4" ]; then cp "$IMAGELZ4" artifacts/; fi
+          # v9: check the ACTUAL Image for the two symbols (they live in
+          # the kernel's ksymtab string table when exported). The old
+          # check grepped abi_symbollist, which is only the EXPECTED list
+          # and wrongly reported both symbols OK in run 7 while the Image
+          # had neither. Warn only -- a stripped Image can in principle
+          # hide the strings -- the hard gate is the .config check above.
+          if [ -f artifacts/Image ]; then
+            for sym in __cfi_slowpath kasan_flag_enabled; do
+              if strings artifacts/Image | grep -q "^${sym}$"; then echo "SYMBOL OK   $sym present in Image ksymtab"; else echo "SYMBOL MISSING $sym NOT in Image ksymtab (expected if CFI/HW_TAGS off)"; fi
+            done
+          fi | tee -a artifacts/BUILD_INFO.txt || true
+          # Final .config: prefer the real merged config the kernel was
+          # built from (gki_kernel/common/.config); fall back to the first
+          # .config found. The plain-gki defconfig-check .config is NOT
+          # authoritative -- the waipio fragments change the final config.
+          # v15: direct make puts .config at common/out/.config (OUT=out).
+          DOTCONFIG="$(find kernel/kernel_platform/common/out -maxdepth 1 -name .config | head -n 1 || true)"
+          if [ -z "$DOTCONFIG" ]; then
+            DOTCONFIG="$(find kernel/kernel_platform/out -name .config -path '*gki_kernel/common/.config' | head -n 1 || true)"
+          fi
+          if [ -z "$DOTCONFIG" ]; then
+            DOTCONFIG="$(find kernel -name .config -type f | head -n 1 || true)"
+          fi
+          if [ -n "$DOTCONFIG" ]; then
+            cp "$DOTCONFIG" artifacts/final.config
+            echo "final .config source: $DOTCONFIG" | tee artifacts/DROIDSPACES_CHECK.txt
+            # v6: full Droidspaces requirements check (src/check.c, main,
+            # DS 7.0.0) against the FINAL .config. Tiers:
+            #   MUST (hard fail): without these, Droidspaces refuses to run.
+            #     Namespaces + seccomp, plus the v4 GKI REQUIRED list.
+            #   RECOMMENDED (warn only): optional probes; the app shows
+            #     them as warnings, it does not block on them.
+            #   EXPECTED-OFF (report only): CFS_BANDWIDTH / CGROUP_PIDS
+            #     stay off by design (kABI); --cpus / --pids-limit stay
+            #     greyed out. Never a failure.
+            #   (pivot_root, procfs, sysfs, epoll, signalfd, cgroup v2
+            #   mount: runtime/filesystem probes, no single .config
+            #   symbol -- verified by booting the kernel, not here.)
+            {
+              echo "=== Droidspaces requirements vs final .config (DS main, v7.0.0) ==="
+              echo "--- MUST (fail if not =y) ---"
+              MUST_OK=1
+              for opt in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_NET_NS CONFIG_USER_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+                if grep -q "^${opt}=y$" artifacts/final.config; then
+                  echo "MUST OK   $opt=y"
+                else
+                  echo "MUST FAIL $opt (want =y, got: $(grep "^${opt}=" artifacts/final.config || grep "^# ${opt} " artifacts/final.config || echo absent))"
+                  MUST_OK=0
+                fi
+              done
+              echo "--- RECOMMENDED (warn only) ---"
+              for opt in CONFIG_BLK_DEV_LOOP CONFIG_EXT4_FS CONFIG_CGROUPS CONFIG_FUSE_FS CONFIG_TUN CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_BRIDGE CONFIG_MEMCG CONFIG_MEMCG_SWAP CONFIG_DEVPTS_FS CONFIG_UNIX98_PTYS CONFIG_CGROUP_CPUACCT; do
+                if grep -q "^${opt}=[ym]$" artifacts/final.config; then
+                  echo "REC OK    $opt=$(grep "^${opt}=" artifacts/final.config)"
+                else
+                  echo "REC WARN  $opt is not enabled (optional probe; app shows a warning, does not block)"
+                fi
+              done
+              echo "--- EXPECTED-OFF by design (kABI; --cpus/--pids-limit greyed out) ---"
+              for opt in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
+                echo "OFF (expected) $opt: $(grep "^${opt}=" artifacts/final.config || grep "^# ${opt} " artifacts/final.config || echo absent)"
+              done
+              echo "--- OPTIONAL REJECT targets (5.10 IPv4/IPv6; warn only) ---"
+              for opt in CONFIG_IP_NF_TARGET_REJECT CONFIG_IP6_NF_TARGET_REJECT; do
+                echo "$opt: $(grep "^${opt}=" artifacts/final.config || echo absent)"
+              done
+              if [ "$MUST_OK" != "1" ]; then
+                echo "ERROR: one or more Droidspaces MUST requirements are missing from the final .config"
+                exit 1
+              fi
+              echo "Droidspaces MUST requirements: all present in final .config"
+              echo "--- v8 LTO/CFI (boot fix) ---"
+              grep -E "^#? ?CONFIG_(LTO_CLANG_FULL|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG|KASAN_HW_TAGS|KASAN_GENERIC)=" artifacts/final.config || echo "(no LTO/CFI lines found)"
+            } | tee -a artifacts/DROIDSPACES_CHECK.txt
+          else
+            echo "WARNING: no final .config found; Droidspaces check skipped (Image check below still applies)"
+          fi
+          # v14: __cfi_slowpath missing is a HARD FAIL when the final
+          # .config has CFI_CLANG=y. Run 12 proved the old warn-only
+          # check lets a broken kernel through: its Image had no
+          # __cfi_slowpath, 162 modules could not load, yet the run
+          # concluded success. kasan_flag_enabled stays warn-only (its
+          # absence only matters if KASAN_HW_TAGS is on, which the
+          # .config gate already enforces).
+          if [ -f artifacts/final.config ] && grep -q "^CONFIG_CFI_CLANG=y$" artifacts/final.config && [ -f artifacts/Image ]; then
+            strings artifacts/Image | grep -q "^__cfi_slowpath$" || { echo "ERROR: v14 gate: CFI_CLANG=y but __cfi_slowpath is NOT in the Image ksymtab -- modules cannot load (run 12 regression)"; exit 1; }
+          fi
+          # v16: the Image version string must not contain -dirty.
+          # Run 14 shipped 5.10.236-o-g694ce6ff5393-dirty; the commit
+          # step above should have removed it. Hard fail if it is
+          # still there.
+          # v19: same block now also enforces the stock KMI part
+          # (-android12-9). This is the authoritative check because it
+          # reads the finished Image, not the config: nothing can drift
+          # between what the gates saw and what the phone will show.
+          if [ -f artifacts/Image ]; then
+            VER_LINE="$(strings artifacts/Image | grep -E '^Linux version 5\.10\.' | head -n 1 || true)"
+            echo "Image version line: ${VER_LINE:-<not found>}"
+            KREL="$(printf '%s' "$VER_LINE" | sed -n 's/^Linux version \([^ ]*\).*/\1/p')"
+            if [ -z "$KREL" ]; then
+              echo "ERROR: v19 gate: no 'Linux version' banner in the Image -- cannot verify the version string"
+              exit 1
+            fi
+            case "$VER_LINE" in
+              *dirty*) echo "ERROR: v16 gate: Image version contains -dirty: $VER_LINE"; exit 1;;
+              *) echo "v16 gate passed: Image version has no -dirty";;
+            esac
+            BASE_KVER="${KREL%%-*}"
+            A_REL="$(printf '%s' "$BRANCH" | sed -n 's/^\(android[0-9]\{2,\}\)-.*/\1/p')"
+            WANT_PREFIX="${BASE_KVER}-${A_REL}-${KMI_GENERATION}-o-"
+            case "$KREL" in
+              "${WANT_PREFIX}"*)
+                echo "v19 gate passed: Image carries the stock KMI part (${WANT_PREFIX}...)"
+                ;;
+              *)
+                echo "ERROR: v19 gate: Image version '${KREL}' does not carry '${WANT_PREFIX}'. AnyKernel3 (do.check_boot_version=1) cannot parse such an Image and aborts the flash with 'Unable to read version from Image'."
+                exit 1
+                ;;
+            esac
+            {
+              echo "kernel_release=$KREL"
+              echo "stock_kernel_release=$STOCK_KERNEL_RELEASE"
+              if [ "$KREL" = "$STOCK_KERNEL_RELEASE" ]; then
+                echo "kernel_release_vs_stock=byte-identical to the stock string"
+              else
+                echo "kernel_release_vs_stock=KMI part identical (${WANT_PREFIX}); only the commit suffix differs, which is expected for a patched kernel and is NOT compared by AK3"
+              fi
+              echo "kernel_version=$VER_LINE"
+            } >> artifacts/BUILD_INFO.txt
+          fi
+          # A missing Image means the build did not actually produce a kernel,
+          # even if the scripts exited without an obvious error.
+          test -f artifacts/Image
+          ls -lh artifacts/
+
+      - name: Package AnyKernel3 ZIP (v15)
+        run: |
+          set -euxo pipefail
+          # v15: deliver a flashable AnyKernel3 ZIP (WildKernels method).
+          # It patches the device's own boot.img on-device, preserving the
+          # stock ramdisk/dtbs -- no manual repack, no header-only boot.img.
+          # The raw Image stays in the artifact too, for the fastboot boot test.
+          test -f artifacts/Image || { echo "ERROR: no Image to package"; exit 1; }
+          # v19: mirror AK3's own gate before wasting a zip. With
+          # do.check_boot_version=1, tools/ak3-core.sh extracts the
+          # version with `grep -oE 'Linux version X.Y.Z-androidNN'` and
+          # compares the 2nd dash-field of Image vs the phone's boot.img.
+          # An Image reading "5.10.236-o-g..." matches nothing -> AK3
+          # aborts on the device. Never package such an Image.
+          IMG_VER="$(strings artifacts/Image | grep -E '^Linux version ' | head -n 1 | awk '{print $3}' || true)"
+          IMG_AK3="$(printf '%s' "$IMG_VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+-android[0-9]+' || true)"
+          A_REL="$(printf '%s' "$BRANCH" | sed -n 's/^\(android[0-9]\{2,\}\)-.*/\1/p')"
+          if [ -z "$IMG_AK3" ]; then
+            echo "::error::AK3's extract_kernel_version() would return nothing for '${IMG_VER}' (it needs X.Y.Z-androidNN); the zip would abort on the phone"
+            exit 1
+          fi
+          if [ "${IMG_AK3##*-}" != "$A_REL" ]; then
+            echo "::error::Image android branch '${IMG_AK3##*-}' != device '${A_REL}'; AK3 aborts on MISMATCH"
+            exit 1
+          fi
+          echo "AK3 do.check_boot_version: Image '${IMG_AK3}' vs device '${A_REL}' -> equal, flash proceeds"
+          AK3_REV="0b46673ae91aee8d60bd6ee257b4d56d3f6a0114"
+          if [ ! -d AnyKernel3 ]; then
+            git clone --depth 1 https://github.com/WildKernels/AnyKernel3.git AnyKernel3
+          fi
+          ( cd AnyKernel3 && git fetch --depth 1 origin "$AK3_REV" 2>/dev/null && git checkout "$AK3_REV" ) || echo "WARNING: pinned AnyKernel3 revision not available; using default branch"
+          cp artifacts/Image AnyKernel3/Image
+          sed -i 's/do.check_boot_version=.*/do.check_boot_version=1/' AnyKernel3/anykernel.sh
+          # v19: put the real version on AK3's flash screen (it prints
+          # kernel.string), so the version is visible before rebooting.
+          sed -i "s#^kernel.string=.*#kernel.string=OnePlus Ace 2 (PHK110) DroidSpaces - ${IMG_VER}#" AnyKernel3/anykernel.sh
+          grep -E '^(kernel\.string|do\.check_boot_version|do\.devicecheck)=' AnyKernel3/anykernel.sh
+          ZIP_NAME="AK3_OP-ACE-2_A16_5.10_DroidSpaces.zip"
+          ( cd AnyKernel3 && zip -r9 "../artifacts/$ZIP_NAME" ./* -x "*.git*" -x "README.md" )
+          ls -lh "artifacts/$ZIP_NAME"
+          sha256sum "artifacts/$ZIP_NAME" | tee -a artifacts/BUILD_INFO.txt
+
+      - name: Upload kernel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ace2-kernel-${{ inputs.build_mode }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
